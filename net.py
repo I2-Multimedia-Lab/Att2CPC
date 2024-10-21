@@ -67,3 +67,4 @@ class AE(nn.Module):
             z = torch.ones((1, self.d)).to(device) * l
             pmf[0, :, l+L] = (self.be(z + 0.5) - self.be(z - 0.5))[0, :]
         return pmf
+

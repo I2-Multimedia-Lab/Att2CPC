@@ -112,3 +112,4 @@ class BitEstimator(nn.Module):
         x = self.f2(x)
         x = self.f3(x)
         return self.f4(x)
+  

@@ -191,3 +191,5 @@ def n_scale_ball(grouped_xyz):
     grouped_xyz = grouped_xyz * scaling.view(B, N, 1, 1)
     return grouped_xyz
 
+
+
