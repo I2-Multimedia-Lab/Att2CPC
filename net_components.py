@@ -1,115 +1,246 @@
-import math
+import os
 import torch
 import torch.nn as nn
-from kit import PointConv, DownSampling, UpSampling_Padzero
-from bitEstimator import BitEstimator
+import math
+from pytorch3d.ops.knn import knn_gather, knn_points
+from utils import *
 
-class AE(nn.Module):  
-    def __init__(self, n_layer,ratio): 
-        super(AE, self).__init__()
+class MLP(nn.Module):
+    def __init__(self, in_channel, mlp, relu, bn):
+        super(MLP, self).__init__()
 
-        self.enc_emb = PointConv(in_channel=3, out_channel=256, kernel_size=8, n_layers=2)
-        self.enc_dense_ls, self.enc_ds_ls = nn.ModuleList(),nn.ModuleList()
-        for i in range(n_layer):
-            self.enc_dense_ls.append(PointConv(in_channel=256, out_channel=256, kernel_size=8, n_layers=4))
-            self.enc_ds_ls.append(DownSampling(ratio=ratio))
-        self.enc_comp = PointConv(in_channel=256, out_channel=256, kernel_size=8, n_layers=2)
-        self.dec_decomp = PointConv(in_channel=256, out_channel=256, kernel_size=8, n_layers=2)
-        self.dec_dense_ls, self.dec_us_ls = nn.ModuleList(),nn.ModuleList()
-        for i in range(n_layer):
-            self.dec_us_ls.append(UpSampling_Padzero())
-            self.dec_dense_ls.append(PointConv(in_channel=256, out_channel=256, kernel_size=8, n_layers=4))
-        self.dec_emb = PointConv(in_channel=256, out_channel=3, kernel_size=8, n_layers=2)
-        self.be = BitEstimator(channel=256)
-        self.n_layer = n_layer
-    
-    def forward(self, batch_x):
+        mlp.insert(0, in_channel)
+        self.mlp_Modules = nn.ModuleList()
+        for i in range(len(mlp) - 1):
+            if relu[i]:
+                if bn[i]:
+                    mlp_Module = nn.Sequential(
+                        nn.Conv2d(mlp[i], mlp[i+1], 1),
+                        nn.BatchNorm2d(mlp[i+1]),
+                        nn.ReLU(),
+                    )
+                else:
+                    mlp_Module = nn.Sequential(
+                        nn.Conv2d(mlp[i], mlp[i+1], 1),
+                        nn.ReLU(),
+                    )
+            else:
+                mlp_Module = nn.Sequential(
+                    nn.Conv2d(mlp[i], mlp[i+1], 1),
+                )
+            self.mlp_Modules.append(mlp_Module)
+
+
+    def forward(self, points, squeeze=False):
+        """
+        Input:
+            points: input points position data, [B, C, N]
+        Return:
+            points: feature data, [B, D, N]
+        """
+        if squeeze:
+            points = points.unsqueeze(-1) # [B, C, N, 1]
         
-        #Encoder
-        xyz, feature = batch_x[:, :, :3], batch_x[:, :, 3:]
-        xyz, feature = xyz.transpose(1, 2), feature.transpose(1, 2)  
-        feature = self.enc_emb(xyz, feature) 
-        xyz_ls = [xyz]
-        for i in range(self.n_layer):   
-            feature = self.enc_dense_ls[i](xyz, feature) 
-            xyz, feature = self.enc_ds_ls[i](xyz, feature)   
-            xyz_ls.append(xyz) 
-        feature = self.enc_comp(xyz, feature)
+        for m in self.mlp_Modules:
+            points = m(points)
+        # [B, D, N, 1]
         
-        #Quantize 
-        if self.training:
-            quantizated_feature = feature + torch.nn.init.uniform_(torch.zeros(feature.size()), -0.5, 0.5).cuda()
-        else:
-            quantizated_feature = torch.round(feature) 
-        feature = quantizated_feature
-        
-        #Decder
-        feature = self.dec_decomp(xyz, feature)
-        for i in range(self.n_layer):
-            xyz, feature = self.dec_us_ls[i](xyz, feature, xyz_ls[-2-i])
-            feature = self.dec_dense_ls[i](xyz, feature) 
-        feature = self.dec_emb(xyz, feature) 
-        
-        #Get output
-        quantizated_feature = quantizated_feature.transpose(1, 2).reshape(-1, 256) 
-        prob = self.be(quantizated_feature + 0.5) - self.be(quantizated_feature - 0.5)
-        total_bits = torch.sum(torch.clamp(-1.0 * torch.log(prob + 1e-10) / math.log(2.0), 0, 50))
-        xyz, feature = xyz.transpose(1, 2), feature.transpose(1, 2)
-        new_batch_x = torch.cat((xyz, feature), dim=-1)
-        
-        return new_batch_x, quantizated_feature, total_bits
+        if squeeze:
+            points = points.squeeze(-1) # [B, D, N] 
+
+        return points
+
+ 
 
 
-    def get_pmf(self, device='cuda'): 
-        self.d = 256
-        L = 99  
-        pmf = torch.zeros(1, self.d, L*2).to(device)
-        for l in range(-L, L):
-            z = torch.ones((1, self.d)).to(device) * l
-            pmf[0, :, l+L] = (self.be(z + 0.5) - self.be(z - 0.5))[0, :]
-        return pmf
-
-
-
-
-import torch.nn.functional as F
-class Bitparm(nn.Module):
-    '''
-    save params
-    '''
-    def __init__(self, channel, final=False):
-        super(Bitparm, self).__init__()
-        self.final = final
-        self.h = nn.Parameter(torch.nn.init.normal_(torch.empty(channel).view(1, -1), 0, 0.01))  
-        self.b = nn.Parameter(torch.nn.init.normal_(torch.empty(channel).view(1, -1), 0, 0.01))  
-        if not final:
-            self.a = nn.Parameter(torch.nn.init.normal_(torch.empty(channel).view(1, -1), 0, 0.01))
-        else:
-            self.a = None
-
-    def forward(self, x):
-        if self.final:
-            return torch.sigmoid(x * F.softplus(self.h) + self.b)
-        else:
-            x = x * F.softplus(self.h) + self.b  
-            return x + torch.tanh(x) * torch.tanh(self.a)
-
-
-
-class BitEstimator(nn.Module): 
-    '''
-    Estimate bit
-    '''
+class SelfAttention(nn.Module):
     def __init__(self, channel):
-        super(BitEstimator, self).__init__()
-        self.f1 = Bitparm(channel)
-        self.f2 = Bitparm(channel)
-        self.f3 = Bitparm(channel)
-        self.f4 = Bitparm(channel, True)
+        super(SelfAttention, self).__init__()
+        self.channel = channel
+        self.q_mlp = nn.Conv2d(in_channels=3, out_channels=channel, kernel_size=1)
+        self.k_mlp = nn.Conv2d(in_channels=3, out_channels=channel, kernel_size=1)
+        self.v_mlp = nn.Conv2d(in_channels=3, out_channels=channel, kernel_size=1)
+        self.softmax = nn.Softmax(dim=-1)
+        self.relu = nn.ReLU()
+
+    def forward(self, grouped_xyz):
+        '''
+        input grouped_feature: B, Cin, K, M
+        output grouped_feature: B, Cout, K, M
+        '''
+        query = self.q_mlp(grouped_xyz).permute((0, 3, 2, 1)) # B, M, K, Cout
+        key = self.k_mlp(grouped_xyz).permute((0, 3, 2, 1)) # B, M, K, Cout
+        value = self.v_mlp(grouped_xyz).permute((0, 3, 2, 1)) # B, M, K, Cout
+        score = torch.matmul(query, key.transpose(2, 3)) # B, M, K, K
+        score = self.softmax(score/math.sqrt(self.channel)) # B, M, K, K
         
-    def forward(self, x):
-        x = self.f1(x)
-        x = self.f2(x)
-        x = self.f3(x)
-        return self.f4(x)
-  
+        pe = self.relu(torch.matmul(score, value)) # B, M, K, Cout
+        # pe = pe.mean(dim=2) # B, M, Cout
+        return pe
+
+
+
+
+class CrossAttention(nn.Module):
+    def __init__(self, channel):
+        super(CrossAttention, self).__init__()
+        self.channel = channel
+        self.q_mlp = nn.Conv2d(in_channels=3, out_channels=channel, kernel_size=1)
+        self.k_mlp = nn.Conv2d(in_channels=channel, out_channels=channel, kernel_size=1)
+        self.v_mlp = nn.Conv2d(in_channels=channel, out_channels=channel, kernel_size=1)
+        
+       
+        self.linear_p_multiplier = SelfAttention(channel)
+        self.linear_p_bias = SelfAttention(channel)
+        
+        self.weight_encoding = nn.Sequential(nn.Linear(channel, channel),nn.ReLU(inplace=True),nn.Linear(channel, channel))
+        self.residual_emb = nn.Sequential(nn.ReLU(),nn.Linear(channel, channel))
+        self.softmax = nn.Softmax(dim=2)
+
+    def forward(self, grouped_xyz, grouped_feature):
+
+        query = self.q_mlp(grouped_xyz).permute((0, 3, 2, 1)) 
+        key = self.k_mlp(grouped_feature).permute((0, 3, 2, 1))  
+        value = self.v_mlp(grouped_feature).permute((0, 3, 2, 1))  
+
+        relation_qk = key - query   
+        pem = self.linear_p_multiplier(grouped_xyz)   
+        relation_qk = relation_qk * pem  
+
+        peb = self.linear_p_bias(grouped_xyz)  
+        relation_qk = relation_qk + peb   
+        value = value + peb  
+
+        weight  = self.weight_encoding(relation_qk)
+        score = self.softmax(weight)  
+        feature = (score*value).sum(dim=2)  
+        feature = self.residual_emb(feature)
+
+        return feature
+
+
+
+class PointConv(nn.Module):
+    def __init__(self, in_channel, out_channel, kernel_size, n_layers):
+        super(PointConv, self).__init__()
+
+        self.in_channel = in_channel
+        self.out_channel = out_channel
+        self.kernel_size = kernel_size
+        self.n_layers = n_layers
+
+
+        self.sa_ls, self.sa_emb_ls = nn.ModuleList(), nn.ModuleList()
+
+        if self.in_channel != self.out_channel:
+            self.linear_in = nn.Linear(in_channel, out_channel)
+        for i in range(n_layers):                        
+            self.sa_emb_ls.append(nn.Sequential(      
+                nn.Linear(out_channel, out_channel),
+                nn.ReLU(),
+            ))
+            self.sa_ls.append(CrossAttention(out_channel))   
+    def forward(self, xyz, feature): 
+        
+        B, _, N = xyz.shape
+        xyz, feature = xyz.transpose(1, 2), feature.transpose(1, 2)
+
+
+        _, idx, grouped_xyz = knn_points(xyz, xyz, K=self.kernel_size, return_nn=True)  
+
+        grouped_xyz = grouped_xyz - xyz.view(B, N, 1, 3)  
+        grouped_xyz = n_scale_ball(grouped_xyz).transpose(1, 3) 
+
+        if self.in_channel != self.out_channel:
+            feature = self.linear_in(feature)
+ 
+        for i in range(self.n_layers):   
+            
+            identity = feature
+            feature = self.sa_emb_ls[i](feature) #
+
+            grouped_feature = knn_gather(feature, idx).transpose(1, 3)  
+
+            output = self.sa_ls[i](grouped_xyz, grouped_feature) 
+
+            feature = identity + output  
+
+        feature = feature.transpose(1, 2)
+
+        return feature
+
+
+class DownSampling(nn.Module):
+    def __init__(self, ratio):
+        super(DownSampling, self).__init__()
+        self.ratio = ratio
+
+    def forward(self, xyz, feature):
+        B, _, N = xyz.shape
+        xyz, feature = xyz.transpose(1, 2), feature.transpose(1, 2)
+
+        M = N//self.ratio
+        sampled_idx = farthest_point_sample_batch(xyz.cpu(), M).cuda()
+        sampled, sampled_feature = index_points(xyz, sampled_idx), index_points(feature, sampled_idx)
+
+        sampled, sampled_feature = sampled.transpose(1, 2), sampled_feature.transpose(1, 2)
+        return sampled, sampled_feature
+
+
+class UpSampling_KNN(nn.Module):
+    def __init__(self, in_channel, out_channel, kernel_size, n_layers):
+        super(UpSampling_KNN, self).__init__()
+        self.in_channel = in_channel
+        self.out_channel = out_channel
+        self.kernel_size = kernel_size
+        self.n_layers = n_layers
+        
+        self.sa_ls, self.sa_emb_ls = nn.ModuleList(), nn.ModuleList()
+        for i in range(n_layers):
+            self.sa_emb_ls.append(nn.Sequential(
+                nn.Linear(out_channel, out_channel),
+                nn.ReLU(),
+            ))
+            self.sa_ls.append(CrossAttention(out_channel))
+
+    def forward(self, xyz, feature, xyz_dense):
+        B, _, N = xyz.shape
+        xyz, feature, xyz_dense = xyz.transpose(1, 2), feature.transpose(1, 2), xyz_dense.transpose(1, 2)
+
+        _, idx, grouped_xyz = knn_points(xyz_dense, xyz, K=self.kernel_size, return_nn=True)
+        grouped_xyz = grouped_xyz - xyz_dense.view(B, -1, 1, 3)
+        grouped_xyz = n_scale_ball(grouped_xyz).transpose(1, 3)
+
+        for i in range(self.n_layers):
+            feature = self.sa_emb_ls[i](feature)
+            grouped_feature = knn_gather(feature, idx).transpose(1, 3) # grouped_feature B, Cmid, K, N
+            output = self.sa_ls[i](grouped_xyz, grouped_feature)
+            feature = output
+
+        xyz_dense, feature = xyz_dense.transpose(1, 2), feature.transpose(1, 2)
+        return xyz_dense, feature
+    
+
+class UpSampling_Padzero(nn.Module):  
+    def __init__(self):
+        super(UpSampling_Padzero, self).__init__()
+
+    def forward(self, xyz, feature, xyz_anchor):
+        B, C, N = feature.shape
+
+        xyz, feature, xyz_anchor = xyz.transpose(1, 2), feature.transpose(1, 2), xyz_anchor.transpose(1, 2)
+        
+        _, idx, grouped_xyz = knn_points(xyz_anchor, xyz, K=1, return_nn=True) 
+
+        grouped_feature = knn_gather(feature, idx).squeeze(-2)
+        grouped_xyz = grouped_xyz.view(B, -1, 3)
+
+        feature_anchor = torch.zeros_like(grouped_feature).cuda()
+        
+        feature_anchor = torch.where(((grouped_xyz == xyz_anchor).sum(dim=-1) == 3).unsqueeze(-1).repeat((1, 1, C)),
+                    grouped_feature, feature_anchor)
+        
+        xyz_anchor, feature_anchor = xyz_anchor.transpose(1, 2), feature_anchor.transpose(1, 2)
+
+        return xyz_anchor, feature_anchor
+    
