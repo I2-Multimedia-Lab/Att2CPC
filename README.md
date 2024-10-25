@@ -12,7 +12,7 @@ torchac
 ```
 
 ## Dataset
-- [ShapeNetPart_with_color] ([https://markdown.com.cn](https://pan.baidu.com/s/1XErZVDJay7fOJBy62_iExQ?pwd=83ou))
+- [ShapeNetPart_with_color] (https://pan.baidu.com/s/1XErZVDJay7fOJBy62_iExQ?pwd=83ou))
  
 
 
